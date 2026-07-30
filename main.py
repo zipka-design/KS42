@@ -20,10 +20,12 @@ def log(tag, msg):
     t = time.strftime("%H:%M:%S")
     print(f"[{t}] [{tag}] {msg}")
 
-def load_json(path):
+def load_json(path, default=None):
     if not os.path.exists(path):
-        save_json({}, path)
-        return {}
+        if default is None:
+            default = {}
+        save_json(default, path)
+        return default
     with open(path, 'r', encoding='utf-8') as f:
         return json.load(f)
 def save_json(data, path):
@@ -505,7 +507,7 @@ get_additional_info_tool = {
 
 def get_additional_info(word):
     """Локальный словарь: поиск информации о людях/понятиях по нечёткому совпадению"""
-    dictionary = load_json("dictionary.json")
+    dictionary = load_json("dictionary.json", [])
     word_lower = word.lower()
     results = []
     all_words = []
@@ -699,7 +701,7 @@ async def handler(event):
         return
 
     if event.raw_text == '/dict':
-        dictionary = load_json("dictionary.json")
+        dictionary = load_json("dictionary.json", [])
         if not dictionary:
             await event.respond("📖 Словарь пуст", link_preview=False)
             return
@@ -735,7 +737,7 @@ async def handler(event):
         }
         if extra.strip():
             entry["addition"] = [extra.strip()]
-        dictionary = load_json("dictionary.json")
+        dictionary = load_json("dictionary.json", [])
         dictionary.append(entry)
         save_json(dictionary, "dictionary.json")
         await event.respond("✅ Добавлено в словарь", link_preview=False)
@@ -743,7 +745,7 @@ async def handler(event):
         return
 
     if event.raw_text == '/dict_del':
-        dictionary = load_json("dictionary.json")
+        dictionary = load_json("dictionary.json", [])
         if not dictionary:
             await event.respond("📖 Словарь пуст", link_preview=False)
             return
@@ -762,7 +764,7 @@ async def handler(event):
             await event.respond("❌ Введи номер цифрой", link_preview=False)
             return
         idx = int(event.raw_text) - 1
-        dictionary = load_json("dictionary.json")
+        dictionary = load_json("dictionary.json", [])
         if idx < 0 or idx >= len(dictionary):
             await event.respond("❌ Неверный номер", link_preview=False)
             return
@@ -774,7 +776,7 @@ async def handler(event):
         return
 
     if event.raw_text == '/dict_edit':
-        dictionary = load_json("dictionary.json")
+        dictionary = load_json("dictionary.json", [])
         if not dictionary:
             await event.respond("📖 Словарь пуст", link_preview=False)
             return
@@ -792,7 +794,7 @@ async def handler(event):
             await event.respond("❌ Введи номер цифрой", link_preview=False)
             return
         idx = int(event.raw_text) - 1
-        dictionary = load_json("dictionary.json")
+        dictionary = load_json("dictionary.json", [])
         if idx < 0 or idx >= len(dictionary):
             await event.respond("❌ Неверный номер", link_preview=False)
             return
@@ -817,7 +819,7 @@ async def handler(event):
         if not words or not explanation:
             await event.respond("❌ Неверный формат. Нужно: слово,слово - объяснение. ~доп инф", link_preview=False)
             return
-        dictionary = load_json("dictionary.json")
+        dictionary = load_json("dictionary.json", [])
         entry = {
             "words": words,
             "meaning": explanation.strip(),
@@ -988,7 +990,7 @@ async def _answer_from_json(event, request_id):
     if extra.strip():
         entry["addition"] = extra.strip()
 
-    dictionary = load_json("dictionary.json")
+    dictionary = load_json("dictionary.json", [])
     dictionary.append(entry)
     save_json(dictionary, "dictionary.json")
     log("dict", f"Добавлено в словарь: {words}")
