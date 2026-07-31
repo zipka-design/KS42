@@ -396,8 +396,8 @@ async def _run_news_item(event):
         # Кнопки: ответить или отмена (удаление)
         buttons = [
             [
-                Button.inline("Ответить", data=f"answer:{new_id_request}"),
-                Button.inline("Отмена", data=f"cancel:{new_id_request}"),
+                Button.inline("✍️ Ответить", data=f"answer:{new_id_request}"),
+                Button.inline("❌ Отмена", data=f"cancel:{new_id_request}"),
             ],
             [
                 Button.inline("✅ Опубликовать", data=f"publish:{new_id_request}"),
@@ -434,7 +434,7 @@ async def _run_news_item(event):
             os.remove(pending_file)
 
     # --- Публикация или сохранение в pending ---
-    if result.wait == False and result.post_text and not result.ask_about:
+    elif result.wait == False and result.post_text and not result.ask_about:
         # Пост готов: создаём уникальный ID для кнопок
         new_id_request = f"{id_request}_{uuid.uuid4().hex}"
         # Добавляем текст поста в контекст для сохранения
@@ -864,7 +864,12 @@ async def handler(event):
         )
 
     if event.raw_text == '/gen_post':
-        await event.respond("Пришлите текст и медиа", link_preview=False)
+        buttons = [
+            [
+                Button.inline("❌ Отмена", data=f"cancel_gen_post"),
+            ]
+        ]
+        await event.respond("Пришлите текст и медиа", link_preview=False, buttons=buttons)
         bot_states[event.sender_id] = 'wait_text_media_for_post'
         return
 
@@ -934,7 +939,7 @@ async def user_handler(event):
             chat.id in ids):                                #проверка что id канала в разрешенных
 
             _name, _msg_text, _link, _chat_id = await _get_chat_info(event)
-            msg_preview = _msg_text[:25]
+            msg_preview = f"{_msg_text[:25]}..."
             await telegram_bot.send_message(ADMIN_ID, f"📩 [{_name}]({_link}): {msg_preview}", link_preview=False,
                                             parse_mode='md')
 
@@ -1195,7 +1200,10 @@ async def _regen_from_json(event, request_id):
 async def callback_handler(event):
     """Обработчик кнопок модерации: publish/reject/regen"""
     data = event.data.decode("utf-8")
-    action, request_id = data.split(":", 1)
+    if ":" in data:
+        action, request_id = data.split(":", 1)
+    else:
+        action, request_id = data, ""
     log("callback", f"action={action} request_id={request_id}")
 
     if action == "publish":
@@ -1279,6 +1287,13 @@ async def callback_handler(event):
 
         msg = await event.get_message()
         await event.edit(text=msg.text + "\n\n__❌ Отменено__", buttons=None, link_preview=False, parse_mode='md')
+
+    elif action == "cancel_gen_post":
+        bot_states.pop(event.sender_id, None)
+        msg = await event.get_message()
+        await event.edit(text=msg.text + "\n\n__Отменено__", buttons=None, link_preview=False)
+        await event.answer("Отмена")
+
 
 async def main():
     """Запуск: авторизация user → старт бота → обработка сообщений"""
