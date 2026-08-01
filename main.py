@@ -7,9 +7,10 @@ from dotenv import load_dotenv
 import json
 import asyncio
 from telethon import TelegramClient, events
-from telethon.tl.types import Message, Channel
+from telethon.tl.types import Message, Channel, PeerUser
 from telethon.errors import SessionPasswordNeededError, RpcCallFailError
 from telethon.tl.custom import Button
+from telethon.extensions.html import unparse
 import base64
 from typing import List, Optional
 from pydantic import BaseModel, Field
@@ -31,7 +32,6 @@ def load_json(path, default=None):
 def save_json(data, path):
     with open(path, 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=4)
-
 
 def load_txt(path):
     if not os.path.exists(path):
@@ -113,8 +113,97 @@ async def _call_gemini(input_data, previous_id=None, max_retries=3):
             log("ai", f"Таймаут (попытка {attempt}/{max_retries}), повтор...")
     raise TimeoutError(f"Gemini не ответил после {max_retries} попыток")
 
+async def _loop_ai(input_data, previous_id=None, log_to=None):
+    """Цикл вызовов Gemini с обработкой function calls. Возвращает финальный interaction."""
+    while True:
+        log("ai", "Цикл вызовов")
+        interaction = await _call_gemini(input_data, previous_id)
+        function_results = []
+        for step in interaction.steps:
+            if step.type == "function_call":
+                result = available_functions[step.name](**step.arguments)
+                log("tool", f"{step.name}({step.arguments}) → {result}")
+                function_results.append({
+                    "type": "function_result",
+                    "name": step.name,
+                    "call_id": step.id,
+                    "result": [{"type": "text", "text": json.dumps(result)}],
+                })
+                if log_to is not None:
+                    log_to.append({
+                        "type": "text",
+                        "text": f"[инструмент {step.name}]: запрос \"{step.arguments}\" → результат: {json.dumps(result, ensure_ascii=False)}"
+                    })
+        if not function_results:
+            return interaction
+        input_data = function_results
+        previous_id = interaction.id
+
 # Очередь задач AI по chat_id — чтобы не обрабатывать один канал параллельно
 calls_to_ai = {}
+
+def chat_name(chat):
+    return getattr(chat, 'title', None) or ' '.join(
+        filter(None, [getattr(chat, 'first_name', ''), getattr(chat, 'last_name', '')])) or 'Без имени'
+
+def chat_username(chat):
+    username = getattr(chat, "username", None)
+    if not username and getattr(chat, "usernames", None):
+        username = getattr(chat.usernames[0], "username", None)
+    return username
+
+def channel_html_line(ch, nees_id=False):
+    name = chat_name(ch)
+    username = chat_username(ch)
+    if username:
+        line = f"• <a href='t.me/{username}'>{name}</a>"
+    else:
+        line = f"• {name} (закрытый тгк)"
+    if nees_id:
+        line += f" <code>{ch.id}</code>"
+    return line + "\n"
+
+def source_line(url_to_msg):
+    if url_to_msg.get("url"):
+        return f"<a href=\"{url_to_msg['url']}\">{url_to_msg.get('msg', '')}</a>\n\n"
+    return ""
+
+async def _origin_chat_and_id(event):
+    """Чат-источник для атрибуции поста: если сообщение переслано из канала — этот канал,
+    иначе — чат, откуда сообщение поступило. Возвращает (chat, msg_id)."""
+    msg = event[0].message if isinstance(event, list) else event.message
+    fwd = getattr(msg, "fwd_from", None)
+    from_id = getattr(fwd, "from_id", None)
+    if from_id is not None and not isinstance(from_id, PeerUser):
+        try:
+            entity = await event._client.get_entity(from_id)
+            return entity, getattr(fwd, "channel_post", None) or msg.id
+        except Exception as e:
+            log("retry", f"get_entity(fwd) {from_id}: {e}")
+    if isinstance(event, list):
+        chat = await event[0].get_chat()
+    else:
+        chat = await event.get_chat()
+    return chat, msg.id
+
+def parse_dict_entry(text):
+    words_part, _, rest = text.partition(" - ")
+    explanation, _, extra = rest.partition(" ~ ")
+    words = [w.strip() for w in words_part.split(",") if w.strip()]
+    entry = {"words": words, "meaning": explanation.strip()}
+    if extra.strip():
+        entry["addition"] = [extra.strip()]
+    return entry
+
+def save_post_context(id_request, new_id, request_to_save, media_ids, post_text, url_to_msg):
+    tmp_path = os.path.join(TEMP_DIR, id_request, f"{new_id}.json")
+    save_json({"request_to_save": request_to_save, "media_ids": media_ids,
+               "post_text": post_text, "url_to_msg": url_to_msg}, tmp_path)
+
+def remove_pending(id_request):
+    pending_file = os.path.join(TEMP_DIR, id_request, f"{id_request}.json")
+    if os.path.exists(pending_file):
+        os.remove(pending_file)
 
 async def prepare_a_news_item(chat_id, event):
     """Очередь: если для chat_id уже идёт запрос — ждём, потом запускаем новый"""
@@ -129,6 +218,133 @@ async def prepare_a_news_item(chat_id, event):
     finally:
         calls_to_ai.pop(chat_id, None)
 
+def moderation_buttons(new_id):
+    return [[Button.inline("✅ Опубликовать", data=f"publish:{new_id}"),
+             Button.inline("❌ Отклонить", data=f"reject:{new_id}")],
+            [Button.inline("🔄 Заново", data=f"regen:{new_id}")]]
+
+async def send_media(media_ids):
+    for media_path in media_ids:
+        if os.path.exists(media_path):
+            await telegram_bot.send_file(ADMIN_ID, media_path)
+            log("media", f"Медиа отправлено: {media_path}")
+
+async def add_media(prepare_request, media_ids, id_request, msg):
+    """Добавляет текст и медиа одного сообщения (фото/видео/аудио) в prepare_request"""
+    if msg.message:
+        html_text = unparse(msg.message, msg.entities or [])
+        prepare_request.append({"type": "text", "text": "message: " + html_text})
+        log("msg", f"Текст: {msg.message}...")
+    if msg.photo:
+        if TYPE_TO_SEND == 0:
+            photo_bytes = await msg.download_media(bytes)
+            prepare_request.append({
+                "type": "image",
+                "data": base64.b64encode(photo_bytes).decode("utf-8"),
+                "mime_type": "image/jpeg"
+            })
+        else:
+            media_path = os.path.join(TEMP_DIR, id_request, f"tmp_photo_{uuid.uuid4().hex}.jpg")
+            await msg.download_media(file=media_path)
+            uploaded_file = await upload_file_and_wait(media_path)
+            prepare_request.append({
+                "type": "image",
+                "uri": uploaded_file.uri,
+                "mime_type": uploaded_file.mime_type
+            })
+            media_ids.append(media_path)
+        log("media", "Фото")
+    if msg.video or msg.video_note:
+        if TYPE_TO_SEND == 0:
+            video_bytes = await msg.download_media(bytes)
+            prepare_request.append({
+                "type": "video",
+                "data": base64.b64encode(video_bytes).decode("utf-8"),
+                "mime_type": "video/mp4"
+            })
+        else:
+            media_path = os.path.join(TEMP_DIR, id_request, f"tmp_video_{uuid.uuid4().hex}.mp4")
+            await msg.download_media(file=media_path)
+            uploaded_file = await upload_file_and_wait(media_path)
+            prepare_request.append({
+                "type": "video",
+                "uri": uploaded_file.uri,
+                "mime_type": uploaded_file.mime_type
+            })
+            media_ids.append(media_path)
+        log("media", "Видео")
+    if msg.voice or msg.audio:
+        if TYPE_TO_SEND == 0:
+            audio_bytes = await msg.download_media(bytes)
+            prepare_request.append({
+                "type": "audio",
+                "data": base64.b64encode(audio_bytes).decode("utf-8"),
+                "mime_type": "audio/ogg"
+            })
+        else:
+            log("upload", "Загрузка аудио")
+            media_path = os.path.join(TEMP_DIR, id_request, f"tmp_audio_{uuid.uuid4().hex}.ogg")
+            await msg.download_media(file=media_path)
+            uploaded_file = await upload_file_and_wait(media_path)
+            prepare_request.append({
+                "type": "audio",
+                "uri": uploaded_file.uri,
+                "mime_type": uploaded_file.mime_type
+            })
+            media_ids.append(media_path)
+        log("media", "Аудио")
+
+async def send_for_moderation(id_request, text, buttons, request_to_save, media_ids, post_text, url_to_msg, new_id=None):
+    """Отправляет пост админу на модерацию, сохраняет контекст в JSON и удаляет pending"""
+    if new_id is None:
+        new_id = f"{id_request}_{uuid.uuid4().hex}"
+    await send_media(media_ids)
+    sent = await telegram_bot.send_message(ADMIN_ID, text, parse_mode='HTML', buttons=buttons, link_preview=False)
+    save_post_context(id_request, new_id, request_to_save, media_ids, post_text, url_to_msg)
+    remove_pending(id_request)
+    log("post", f"Пост отправлен, msg_id={sent.id}")
+    return sent
+
+async def buffer_or_process(chat, event):
+    grouped_id = event.message.grouped_id
+    if grouped_id:
+        if grouped_id not in album_buffers:
+            album_buffers[grouped_id] = {"events": []}
+        album_buffers[grouped_id]["events"].append(event)
+        asyncio.create_task(delayed_album(grouped_id))
+    else:
+        await prepare_a_news_item(chat.id, event)
+
+def json_path_for(request_id):
+    id_request = request_id.rsplit("_", 1)[0]
+    return os.path.join(TEMP_DIR, id_request, f"{request_id}.json")
+
+def cleanup_post(json_path):
+    data = load_json(json_path)
+    for m in data.get("media_ids", []):
+        if os.path.exists(m):
+            os.remove(m)
+    os.remove(json_path)
+
+def format_dict_entry(entry):
+    words = ", ".join(entry.get("words", []))
+    meaning = entry.get("meaning", entry.get("text", ""))
+    addition = entry.get("addition", entry.get("extra", ""))
+    if isinstance(addition, list):
+        addition = ", ".join(str(a) for a in addition)
+    line = f"{words} — {meaning}"
+    if addition:
+        line += f" ~ {addition}"
+    return line
+
+def format_dictionary(dictionary):
+    return "\n".join(f"{i}. {format_dict_entry(entry)}" for i, entry in enumerate(dictionary, 1))
+
+def load_post_context(json_path):
+    data = load_json(json_path)
+    return (data.get("request_to_save", []), data.get("media_ids", []),
+            data.get("url_to_msg", {"msg": "", "url": ""}))
+
 async def _run_news_item(event):
     # Загружаем инструкцию для Gemini из instruction.md
     INSTRUCTION = load_txt("instruction.md")
@@ -137,11 +353,12 @@ async def _run_news_item(event):
     if isinstance(event, list):
         # Альбом: берём chat из первого фото
         chat = await event[0].get_chat()
-        name = chat.title
+        origin, origin_msg_id = await _origin_chat_and_id(event[0])
     else:
         # Одиночное сообщение
         chat = await event.get_chat()
-        name = getattr(chat, "title", "")
+        origin, origin_msg_id = await _origin_chat_and_id(event)
+    name = chat_name(origin)
 
     # ID канала как строка — используется для папки и имён JSON
     id_request = str(chat.id)
@@ -174,16 +391,8 @@ async def _run_news_item(event):
         media_ids = []
 
     url_to_msg = {"msg": "", "url": ""}
-
-    _name = getattr(chat, 'title', None) or ' '.join(
-        filter(None, [getattr(chat, 'first_name', ''), getattr(chat, 'last_name', '')])) or 'Без имени'
-    username = getattr(chat, "username", None)
-    if not username and getattr(chat, "usernames", None):
-        username = getattr(chat.usernames[0], "username", None)
-
-    url_to_msg["msg"] = f"Из канала {_name}"
-    msg_id = event[0].message.id if isinstance(event, list) else event.message.id
-    url_to_msg["url"] =  f"https://t.me/{username}/{msg_id}"
+    url_to_msg["msg"] = f"Из канала {chat_name(origin)}"
+    url_to_msg["url"] = f"https://t.me/{chat_username(origin)}/{origin_msg_id}"
 
     if chat.id == (await telegram_bot.get_me()).id or chat.id == ADMIN_ID or chat.id == CHANNEL_ID:
         url_to_msg = {"msg": "", "url": ""}
@@ -192,156 +401,10 @@ async def _run_news_item(event):
     if isinstance(event, list):
         # Альбом: обходим каждое сообщение в группе
         for i in event:
-            date = i.message.date
-
-            if i.message.message:
-                message = i.message.message
-                prepare_request.append(
-                    {
-                        "type": "text",
-                        "text": "message: " + message,
-                    }
-                )
-                log("msg", f"Текст: {message}...")
-            if i.message.photo:
-                # Фото: загружаем как base64 или через URI
-                if TYPE_TO_SEND == 0:
-                    photo_bytes = await i.message.download_media(bytes)
-                    image_b64 = base64.b64encode(photo_bytes).decode("utf-8")
-                    prepare_request.append({
-                            "type": "image",
-                            "data": image_b64,
-                            "mime_type": "image/jpeg"
-                    })
-                else:
-                    # URI-режим: скачиваем временно, загружаем в Gemini, получаем URI
-                    media_path = os.path.join(TEMP_DIR, id_request, f"tmp_photo_{uuid.uuid4().hex}.jpg")
-                    await i.message.download_media(file=media_path)
-                    uploaded_file = await upload_file_and_wait(media_path)
-                    prepare_request.append({
-                        "type": "image",
-                        "uri": uploaded_file.uri,
-                        "mime_type": uploaded_file.mime_type
-                    })
-                    media_ids.append(media_path)
-                log("media", "Фото")
-            if i.message.video or i.message.video_note:
-                # Видео: аналогично фото
-                if TYPE_TO_SEND == 0:
-                    video_bytes = await i.message.download_media(bytes)
-                    video_b64 = base64.b64encode(video_bytes).decode("utf-8")
-                    prepare_request.append({
-                        "type": "video",
-                        "data": video_b64,
-                        "mime_type": "video/mp4"
-                    })
-                else:
-                    media_path = os.path.join(TEMP_DIR, id_request, f"tmp_video_{uuid.uuid4().hex}.mp4")
-                    await i.message.download_media(file=media_path)
-                    uploaded_file = await upload_file_and_wait(media_path)
-                    prepare_request.append({
-                        "type": "video",
-                        "uri": uploaded_file.uri,
-                        "mime_type": uploaded_file.mime_type
-                    })
-                    media_ids.append(media_path)
-                log("media", "Видео")
-            if i.message.voice or i.message.audio:
-                # Аудио: аналогично фото
-                if TYPE_TO_SEND == 0:
-                    audio_bytes = await i.message.download_media(bytes)
-                    audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
-                    prepare_request.append({
-                        "type": "audio",
-                        "data": audio_b64,
-                        "mime_type": "audio/ogg"
-                    })
-                else:
-                    log("upload", "Загрузка аудио")
-                    media_path = os.path.join(TEMP_DIR, id_request, f"tmp_audio_{uuid.uuid4().hex}.ogg")
-                    await i.message.download_media(file=media_path)
-                    uploaded_file = await upload_file_and_wait(media_path)
-                    prepare_request.append({
-                        "type": "audio",
-                        "uri": uploaded_file.uri,
-                        "mime_type": uploaded_file.mime_type
-                    })
-                    media_ids.append(media_path)
-                log("media", "Аудио")
+            await add_media(prepare_request, media_ids, id_request, i.message)
     else:
-        # Одиночное сообщение: обрабатываем аналогично, но без цикла
-        date = event.message.date
-
-        if event.message.message:
-            message = event.message.message
-            prepare_request.append({
-                    "type": "text",
-                    "text": "message: " + message
-                })
-            log("msg", f"Текст: {message}...")
-
-        if event.message.photo:
-            if TYPE_TO_SEND == 0:
-                photo_bytes = await event.message.download_media(bytes)
-                image_b64 = base64.b64encode(photo_bytes).decode("utf-8")
-                prepare_request.append({
-                        "type": "image",
-                        "data": image_b64,
-                        "mime_type": "image/jpeg"
-                })
-            else:
-                media_path = os.path.join(TEMP_DIR, id_request, f"tmp_photo_{uuid.uuid4().hex}.jpg")
-                await event.message.download_media(file=media_path)
-                uploaded_file = await upload_file_and_wait(media_path)
-                prepare_request.append({
-                    "type": "image",
-                    "uri": uploaded_file.uri,
-                    "mime_type": uploaded_file.mime_type
-                })
-                media_ids.append(media_path)
-            log("media", "Фото")
-
-        if event.message.video or event.message.video_note:
-            if TYPE_TO_SEND == 0:
-                video_bytes = await event.message.download_media(bytes)
-                video_b64 = base64.b64encode(video_bytes).decode("utf-8")
-                prepare_request.append({
-                    "type": "video",
-                    "data": video_b64,
-                    "mime_type": "video/mp4"
-                })
-            else:
-                media_path = os.path.join(TEMP_DIR, id_request, f"tmp_video_{uuid.uuid4().hex}.mp4")
-                await event.message.download_media(file=media_path)
-                uploaded_file = await upload_file_and_wait(media_path)
-                prepare_request.append({
-                    "type": "video",
-                    "uri": uploaded_file.uri,
-                    "mime_type": uploaded_file.mime_type
-                })
-                media_ids.append(media_path)
-            log("media", "Видео")
-
-        if event.message.voice or event.message.audio:
-            if TYPE_TO_SEND == 0:
-                audio_bytes = await event.message.download_media(bytes)
-                audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
-                prepare_request.append({
-                    "type": "audio",
-                    "data": audio_b64,
-                    "mime_type": "audio/ogg"
-                })
-            else:
-                media_path = os.path.join(TEMP_DIR, id_request, f"tmp_audio_{uuid.uuid4().hex}.ogg")
-                await event.message.download_media(file=media_path)
-                uploaded_file = await upload_file_and_wait(media_path)
-                prepare_request.append({
-                    "type": "audio",
-                    "uri": uploaded_file.uri,
-                    "mime_type": uploaded_file.mime_type
-                })
-                media_ids.append(media_path)
-            log("media", "Аудио")
+        # Одиночное сообщение
+        await add_media(prepare_request, media_ids, id_request, event.message)
 
     # Ссылки на контекст для сохранения и для отправки в AI
     request_to_save = prepare_request  # что запишем в JSON
@@ -350,38 +413,7 @@ async def _run_news_item(event):
     log("ai", f"Запрос ({len(to_ai)} частей)")
 
     # --- Цикл вызовов Gemini (с обработкой function calls) ---
-    previous_id = None  # ID предыдущего взаимодействия для цепочки
-    while True:
-        log("ai", "Цикл вызовов")
-        # Отправляем запрос в Gemini с инструментами (таймаут 60 с, повтор при ошибке)
-        interaction = await _call_gemini(to_ai, previous_id)
-        # Обрабатываем вызовы инструментов (get_additional_info и тд)
-        function_results = []
-        for step in interaction.steps:
-            if step.type == "function_call":
-                result = available_functions[step.name](**step.arguments)
-                log("tool", f"{step.name}({step.arguments}) → {result}")
-                # Формируем результат для следующего шага AI
-                t = {
-                    "type": "function_result",
-                    "name": step.name,
-                    "call_id": step.id,
-                    "result": [{"type": "text", "text": json.dumps(result)}],
-                }
-                function_results.append(t)
-                # Добавляем в контекст для сохранения в JSON
-                request_to_save.append({
-                    "type": "text",
-                    "text": f"[инструмент {step.name}]: запрос \"{step.arguments}\" → результат: {json.dumps(result, ensure_ascii=False)}"
-                })
-
-        # Если не было вызовов инструментов — AI готовит финальный ответ
-        if not function_results:
-            break
-
-        # Отправляем результаты инструментов обратно в AI
-        to_ai = function_results
-        previous_id = interaction.id  # сохраняем ID для цепочки
+    interaction = await _loop_ai(to_ai, log_to=request_to_save)
 
     # Парсим JSON-ответ Gemini в модель Output
     result = Output.model_validate_json(interaction.output_text)
@@ -390,7 +422,7 @@ async def _run_news_item(event):
         new_id_request = f"{id_request}_{uuid.uuid4().hex}"
         request_to_save.append({
             "type": "text",
-            "text": f"вопрос: " + result.ask_about
+            "text": "вопрос: " + result.ask_about
         })
 
         # Кнопки: ответить или отмена (удаление)
@@ -403,35 +435,11 @@ async def _run_news_item(event):
                 Button.inline("✅ Опубликовать", data=f"publish:{new_id_request}"),
             ]
         ]
-        # Отправляем медиа отдельными сообщениями после текста
-        for media_path in media_ids:
-            if os.path.exists(media_path):
-                await telegram_bot.send_file(ADMIN_ID, media_path)
-                log("media", f"Медиа отправлено: {media_path}")
 
         # Отправляем пост админу на модерацию
-        source_line = ""
-        if url_to_msg.get("url"):
-            source_line = f"[{url_to_msg.get('msg', '')}]({url_to_msg['url']})\n\n"
         text_part = "Текста поста нет" if not result.post_text else f"Пост: {result.post_text}"
-        sent = await telegram_bot.send_message(
-            ADMIN_ID,
-            f"{source_line}{text_part}\nВопрос: {result.ask_about}",
-            parse_mode='md',
-            buttons=buttons,
-            link_preview=False,
-        )
-        # Сохраняем контекст в JSON с уникальным ID (для regen)
-        tmp_path = os.path.join(TEMP_DIR, id_request, f"{new_id_request}.json")
-        save_json({"request_to_save": request_to_save, "media_ids": media_ids, "post_text": result.post_text,
-                   "url_to_msg": url_to_msg}, tmp_path)
-
-        log("post", f"Пост отправлен, msg_id={sent.id}")
-
-        # Удаляем pending JSON (он больше не нужен — пост ушёл на модерацию)
-        pending_file = os.path.join(TEMP_DIR, id_request, f"{id_request}.json")
-        if os.path.exists(pending_file):
-            os.remove(pending_file)
+        text = f"{source_line(url_to_msg)}{text_part}\nВопрос: {result.ask_about}"
+        await send_for_moderation(id_request, text, buttons, request_to_save, media_ids, result.post_text, url_to_msg, new_id=new_id_request)
 
     # --- Публикация или сохранение в pending ---
     elif result.wait == False and result.post_text and not result.ask_about:
@@ -443,44 +451,9 @@ async def _run_news_item(event):
             "text": f"пост: " + result.post_text
         })
 
-        # Кнопки модерации: опубликовать / отклонить / заново
-        buttons = [
-            [
-                Button.inline("✅ Опубликовать", data=f"publish:{new_id_request}"),
-                Button.inline("❌ Отклонить", data=f"reject:{new_id_request}"),
-            ],
-            [
-                Button.inline("🔄 Заново", data=f"regen:{new_id_request}"),
-            ],
-        ]
-        # Отправляем медиа отдельными сообщениями после текста
-        for media_path in media_ids:
-            if os.path.exists(media_path):
-                await telegram_bot.send_file(ADMIN_ID, media_path)
-                log("media", f"Медиа отправлено: {media_path}")
-
         # Отправляем пост админу на модерацию
-        source_line = ""
-        if url_to_msg.get("url"):
-            source_line = f"[{url_to_msg.get('msg', '')}]({url_to_msg['url']})\n\n"
-        sent = await telegram_bot.send_message(
-            ADMIN_ID,
-            source_line + result.post_text,
-            parse_mode='md',
-            buttons=buttons,
-            link_preview=False,
-        )
-
-        # Сохраняем контекст в JSON с уникальным ID (для regen)
-        tmp_path = os.path.join(TEMP_DIR, id_request, f"{new_id_request}.json")
-        save_json({"request_to_save": request_to_save, "media_ids": media_ids, "post_text": result.post_text, "url_to_msg": url_to_msg}, tmp_path)
-
-        log("post", f"Пост отправлен, msg_id={sent.id}")
-
-        # Удаляем pending JSON (он больше не нужен — пост ушёл на модерацию)
-        pending_file = os.path.join(TEMP_DIR, id_request, f"{id_request}.json")
-        if os.path.exists(pending_file):
-            os.remove(pending_file)
+        text = f"{source_line(url_to_msg)}{result.post_text}"
+        await send_for_moderation(id_request, text, moderation_buttons(new_id_request), request_to_save, media_ids, result.post_text, url_to_msg, new_id=new_id_request)
 
     else:
         # wait=True или пустой текст: сохраняем контекст в pending для следующего сообщения
@@ -572,16 +545,7 @@ async def update_channels_mes():
             log("file", f"IDs из config.json: {ids}")
             for i in ids:
                 ch = await _get_entity_with_retry(telegram_user, i)
-
-                name = getattr(ch, 'title', None) or ' '.join(filter(None, [getattr(ch, 'first_name', ''), getattr(ch, 'last_name', '')])) or 'Без имени'
-                username = getattr(ch, "username", None)
-                if not username and getattr(ch, "usernames", None):
-                    username = getattr(ch.usernames[0], "username", None)
-
-                if username:
-                    channels += f"""• <a href='t.me/{username}'>{name}</a>\n"""
-                else:
-                    channels += f"• {name} (закрытый тгк)\n"
+                channels += channel_html_line(ch)
 
             await telegram_bot.edit_message(
                 CHANNEL_ID,
@@ -665,17 +629,7 @@ async def handler(event):
 
         for i in ids:
             ch = await _get_entity_with_retry(telegram_user, i)
-
-            name = getattr(ch, 'title', None) or ' '.join(
-                filter(None, [getattr(ch, 'first_name', ''), getattr(ch, 'last_name', '')])) or 'Без имени'
-            username = getattr(ch, "username", None)
-            if not username and getattr(ch, "usernames", None):
-                username = getattr(ch.usernames[0], "username", None)
-
-            if username:
-                channels_list += f"""• <a href='t.me/{username}'>{name}</a> <code>{ch.id}</code>\n"""
-            else:
-                channels_list += f"• {name} (закрытый тгк) <code>{ch.id}</code>\n"
+            channels_list += channel_html_line(ch)
 
         await event.respond(f"Отправь id канала для удаления:\n\n{channels_list}", link_preview=False, parse_mode='HTML')
         bot_states[event.sender_id] = 'wait_id_to_del'
@@ -705,17 +659,8 @@ async def handler(event):
         if not dictionary:
             await event.respond("📖 Словарь пуст", link_preview=False)
             return
-        lines = []
-        for i, entry in enumerate(dictionary, 1):
-            words = ", ".join(entry.get("words", []))
-            meaning = entry.get("meaning", entry.get("text", ""))
-            addition = entry.get("addition", entry.get("extra", ""))
-            line = f"{i}. {words} — {meaning}"
-            if addition:
-                line += f" ~ {addition}"
-            lines.append(line)
-        text = "📖 **Словарь:**\n\n" + "\n".join(lines)
-        await event.respond(text, parse_mode='md', link_preview=False)
+        text = "📖 <b>Словарь:</b>\n\n" + format_dictionary(dictionary)
+        await event.respond(text, parse_mode='HTML', link_preview=False)
         return
 
     if event.raw_text == '/dict_add':
@@ -725,23 +670,15 @@ async def handler(event):
     if bot_states.get(event.sender_id) == 'wait_dict_add':
         bot_states.pop(event.sender_id, None)
         text = event.raw_text.strip()
-        words_part, _, rest = text.partition("-")
-        explanation, _, extra = rest.partition("~")
-        words = [w.strip() for w in words_part.split(",") if w.strip()]
-        if not words or not explanation:
+        entry = parse_dict_entry(text)
+        if not entry["words"] or not entry["meaning"]:
             await event.respond("❌ Неверный формат. Нужно: слово,слово - объяснение. ~доп инф", link_preview=False)
             return
-        entry = {
-            "words": words,
-            "meaning": explanation.strip(),
-        }
-        if extra.strip():
-            entry["addition"] = [extra.strip()]
         dictionary = load_json("dictionary.json", [])
         dictionary.append(entry)
         save_json(dictionary, "dictionary.json")
         await event.respond("✅ Добавлено в словарь", link_preview=False)
-        log("dict", f"dict_add: {words}")
+        log("dict", f"dict_add: {entry['words']}")
         return
 
     if event.raw_text == '/dict_del':
@@ -749,13 +686,7 @@ async def handler(event):
         if not dictionary:
             await event.respond("📖 Словарь пуст", link_preview=False)
             return
-        lines = []
-        for i, entry in enumerate(dictionary, 1):
-            words = ", ".join(entry.get("words", []))
-            meaning = entry.get("meaning", entry.get("text", ""))
-            line = f"{i}. {words} — {meaning}"
-            lines.append(line)
-        await event.respond("Введи номер записи для удаления:\n\n" + "\n".join(lines), link_preview=False)
+        await event.respond("Введи номер записи для удаления:\n\n" + format_dictionary(dictionary), link_preview=False)
         bot_states[event.sender_id] = 'wait_dict_del'
         return
     if bot_states.get(event.sender_id) == 'wait_dict_del':
@@ -780,13 +711,7 @@ async def handler(event):
         if not dictionary:
             await event.respond("📖 Словарь пуст", link_preview=False)
             return
-        lines = []
-        for i, entry in enumerate(dictionary, 1):
-            words = ", ".join(entry.get("words", []))
-            meaning = entry.get("meaning", entry.get("text", ""))
-            line = f"{i}. {words} — {meaning}"
-            lines.append(line)
-        await event.respond("Введи номер записи для редактирования:\n\n" + "\n".join(lines), link_preview=False)
+        await event.respond("Введи номер записи для редактирования:\n\n" + format_dictionary(dictionary), link_preview=False)
         bot_states[event.sender_id] = 'wait_dict_edit_num'
         return
     if bot_states.get(event.sender_id) == 'wait_dict_edit_num':
@@ -800,36 +725,22 @@ async def handler(event):
             return
         bot_states[event.sender_id] = f'wait_dict_edit_val:{idx}'
         entry = dictionary[idx]
-        words = ", ".join(entry.get("words", []))
-        meaning = entry.get("meaning", entry.get("text", ""))
-        addition = entry.get("addition", entry.get("extra", ""))
-        current = f"{words} — {meaning}"
-        if addition:
-            current += f" ~ {addition}"
-        await event.respond(f"Текущее:\n{current}\n\nВведи новое: слово,слово - объяснение. ~доп инф", link_preview=False)
+        await event.respond(f"Текущее:\n{format_dict_entry(entry)}\n\nВведи новое: слово,слово - объяснение. ~доп инф", link_preview=False)
         return
     state = bot_states.get(event.sender_id, "")
     if state.startswith("wait_dict_edit_val:"):
         bot_states.pop(event.sender_id, None)
         idx = int(state.split(":", 1)[1])
         text = event.raw_text.strip()
-        words_part, _, rest = text.partition("-")
-        explanation, _, extra = rest.partition("~")
-        words = [w.strip() for w in words_part.split(",") if w.strip()]
-        if not words or not explanation:
+        entry = parse_dict_entry(text)
+        if not entry["words"] or not entry["meaning"]:
             await event.respond("❌ Неверный формат. Нужно: слово,слово - объяснение. ~доп инф", link_preview=False)
             return
         dictionary = load_json("dictionary.json", [])
-        entry = {
-            "words": words,
-            "meaning": explanation.strip(),
-        }
-        if extra.strip():
-            entry["addition"] = [extra.strip()]
         dictionary[idx] = entry
         save_json(dictionary, "dictionary.json")
         await event.respond("✅ Запись обновлена", link_preview=False)
-        log("dict", f"dict_edit #{idx + 1}: {words}")
+        log("dict", f"dict_edit #{idx + 1}: {entry['words']}")
         return
 
     if event.raw_text == '/list':
@@ -842,17 +753,7 @@ async def handler(event):
         channels = ""
         for i in ids:
             ch = await _get_entity_with_retry(telegram_user, i)
-
-            name = getattr(ch, 'title', None) or ' '.join(
-                filter(None, [getattr(ch, 'first_name', ''), getattr(ch, 'last_name', '')])) or 'Без имени'
-            username = getattr(ch, "username", None)
-            if not username and getattr(ch, "usernames", None):
-                username = getattr(ch.usernames[0], "username", None)
-
-            if username:
-                channels += f"""• <a href='t.me/{username}'>{name}</a> <code>{ch.id}</code>\n"""
-            else:
-                channels += f"• {name} (закрытый тгк) <code>{ch.id}</code>\n"
+            channels += channel_html_line(ch, True)
 
         await event.respond(
             f"""
@@ -892,17 +793,8 @@ async def handler(event):
 
     if state == "wait_text_media_for_post":
         bot_states.pop(event.sender_id, None)
-
         chat = await event.get_chat()
-        grouped_id = event.message.grouped_id
-        if grouped_id:
-            if grouped_id not in album_buffers:
-                album_buffers[grouped_id] = {"events": []}
-            album_buffers[grouped_id]["events"].append(event)
-            asyncio.create_task(delayed_album(grouped_id))
-        else:
-            await prepare_a_news_item(chat.id, event)
-
+        await buffer_or_process(chat, event)
         return
 
     if event.raw_text == '/get':
@@ -912,18 +804,21 @@ async def handler(event):
         messages = await telegram_bot.get_messages(CHANNEL_ID, ids=msg_id)
         log("debug", messages.stringify() if messages else "нет сообщения")
 
+def styled_text_html(msg):
+    """Текст сообщения в HTML с сохранённым форматированием исходного поста (жирный, курсив, ссылки и т.д.)"""
+    if not msg.message:
+        return "(медиа)"
+    return unparse(msg.message, msg.entities or [])
+
 async def _get_chat_info(event):
-    """Извлекает из event имя чата, текст сообщения, прямую ссылку и id. Возвращает (name, id)"""
-    chat = await event.get_chat()
-    name = getattr(chat, 'title', None) or ' '.join(
-        filter(None, [getattr(chat, 'first_name', ''), getattr(chat, 'last_name', '')])) or 'Без имени'
-    msg_text = event.message.message if event.message.message else "(медиа)"
-    username = getattr(chat, "username", None)
-    if not username and getattr(chat, "usernames", None):
-        username = getattr(chat.usernames[0], "username", None)
-    link = f"https://t.me/{username}/{event.message.id}" if username else "нет ссылки"
-    log("info", f"[{name}] {msg_text} {link}")
-    return name, msg_text, link, chat.id
+    """Извлекает из event имя чата, текст сообщения (HTML со стилями), прямую ссылку и id. Возвращает (name, text_html, link, id)"""
+    chat, msg_id = await _origin_chat_and_id(event)
+    name = chat_name(chat)
+    username = chat_username(chat)
+    link = f"https://t.me/{username}/{msg_id}" if username else "нет ссылки"
+    msg_html = styled_text_html(event.message)
+    log("info", f"[{name}] {msg_html} {link}")
+    return name, msg_html, link, chat.id
 
 @telegram_user.on(events.NewMessage)
 async def user_handler(event):
@@ -939,18 +834,12 @@ async def user_handler(event):
             chat.id in ids):                                #проверка что id канала в разрешенных
 
             _name, _msg_text, _link, _chat_id = await _get_chat_info(event)
-            msg_preview = f"{_msg_text[:25]}..."
-            await telegram_bot.send_message(ADMIN_ID, f"📩 [{_name}]({_link}): {msg_preview}", link_preview=False,
-                                            parse_mode='md')
+            msg_preview = f"{_msg_text}..." if _msg_text != "(медиа)" else _msg_text
+            name_html = f"<a href='{_link}'>{_name}</a>" if _link != "нет ссылки" else _name
+            await telegram_bot.send_message(ADMIN_ID, f"📩 {name_html}: {msg_preview}", link_preview=False,
+                                            parse_mode='HTML')
 
-            grouped_id = event.message.grouped_id
-            if grouped_id:
-                if grouped_id not in album_buffers:
-                    album_buffers[grouped_id] = {"events": []}
-                album_buffers[grouped_id]["events"].append(event)
-                asyncio.create_task(delayed_album(grouped_id))
-            else:
-                await prepare_a_news_item(chat.id, event)
+            await buffer_or_process(chat, event)
 
     except Exception as e:
         log("error", f"user_handler: {e}")
@@ -966,39 +855,25 @@ async def delayed_album(grouped_id):
 async def _answer_from_json(event, request_id):
     """Обрабатывает ответ админа на ask_about: сохраняет в словарь и перегенерриует пост"""
     id_request = request_id.rsplit("_", 1)[0]
-    json_path = os.path.join(TEMP_DIR, id_request, f"{request_id}.json")
+    json_path = json_path_for(request_id)
 
     if not os.path.exists(json_path):
         await telegram_bot.send_message(ADMIN_ID, "❌ Файл не найден", link_preview=False)
         return
 
-    data = load_json(json_path)
-    prepare_request = data.get("request_to_save", [])
-    media_ids = data.get("media_ids", [])
-    url_to_msg = data.get("url_to_msg", {"msg": "", "url": ""})
+    prepare_request, media_ids, url_to_msg = load_post_context(json_path)
 
     # Парсим ответ админа: слово,слово - объяснение. ~доп инф
-    text = event.raw_text.strip()
-    words_part, _, rest = text.partition(" - ")
-    explanation, _, extra = rest.partition(" ~ ")
-    words = [w.strip() for w in words_part.split(",") if w.strip()]
-
-    if not words or not explanation:
+    entry = parse_dict_entry(event.raw_text.strip())
+    if not entry["words"] or not entry["meaning"]:
         await telegram_bot.send_message(ADMIN_ID, "❌ Неверный формат. Нужно: слово,слово - объяснение. ~доп инф", link_preview=False)
         return
 
     # Сохраняем в словарь
-    entry = {
-        "words": words,
-        "meaning": explanation.strip(),
-    }
-    if extra.strip():
-        entry["addition"] = extra.strip()
-
     dictionary = load_json("dictionary.json", [])
     dictionary.append(entry)
     save_json(dictionary, "dictionary.json")
-    log("dict", f"Добавлено в словарь: {words}")
+    log("dict", f"Добавлено в словарь: {entry['words']}")
 
     # Добавляем новое знание в контекст для AI
     prepare_request.append({
@@ -1010,28 +885,7 @@ async def _answer_from_json(event, request_id):
     request_to_save = prepare_request
     to_ai = prepare_request
 
-    previous_id = None
-    while True:
-        interaction = await _call_gemini(to_ai, previous_id)
-        function_results = []
-        for step in interaction.steps:
-            if step.type == "function_call":
-                result = available_functions[step.name](**step.arguments)
-                log("tool", f"{step.name}({step.arguments}) → {result}")
-                function_results.append({
-                    "type": "function_result",
-                    "name": step.name,
-                    "call_id": step.id,
-                    "result": [{"type": "text", "text": json.dumps(result)}],
-                })
-                request_to_save.append({
-                    "type": "text",
-                    "text": f"[инструмент {step.name}]: запрос \"{step.arguments}\" → результат: {json.dumps(result, ensure_ascii=False)}"
-                })
-        if not function_results:
-            break
-        to_ai = function_results
-        previous_id = interaction.id
+    interaction = await _loop_ai(to_ai, log_to=request_to_save)
 
     result = Output.model_validate_json(interaction.output_text)
 
@@ -1046,35 +900,11 @@ async def _answer_from_json(event, request_id):
             "text": f"пост: " + result.post_text
         })
 
-        buttons = [
-            [
-                Button.inline("✅ Опубликовать", data=f"publish:{new_id}"),
-                Button.inline("❌ Отклонить", data=f"reject:{new_id}"),
-            ],
-            [
-                Button.inline("🔄 Заново", data=f"regen:{new_id}"),
-            ],
-        ]
-        for media_path in media_ids:
-            if os.path.exists(media_path):
-                await telegram_bot.send_file(ADMIN_ID, media_path)
-                log("media", f"Медиа отправлено: {media_path}")
+        # Отправляем новый вариант поста админу на модерацию
+        text = f"{source_line(url_to_msg)}{result.post_text}"
+        await send_for_moderation(id_request, text, moderation_buttons(new_id), request_to_save, media_ids, result.post_text, url_to_msg, new_id=new_id)
 
-        source_line = ""
-        if url_to_msg.get("url"):
-            source_line = f"[{url_to_msg.get('msg', '')}]({url_to_msg['url']})\n\n"
-        sent = await telegram_bot.send_message(
-            ADMIN_ID,
-            source_line + result.post_text,
-            parse_mode='md',
-            buttons=buttons,
-            link_preview=False,
-        )
-
-        tmp_path = os.path.join(TEMP_DIR, id_request, f"{new_id}.json")
-        save_json({"request_to_save": request_to_save, "media_ids": media_ids, "post_text": result.post_text, "url_to_msg": url_to_msg}, tmp_path)
-
-        log("answer", f"Пост с новым знанием отправлен, msg_id={sent.id}")
+        log("answer", "Пост с новым знанием отправлен")
 
         if os.path.exists(json_path):
             os.remove(json_path)
@@ -1087,7 +917,7 @@ async def _regen_from_json(event, request_id):
     # Извлекаем chat_id из request_id (формат: chat_id_uuid)
     id_request = request_id.rsplit("_", 1)[0]
     # Путь к JSON с контекстом этого поста
-    json_path = os.path.join(TEMP_DIR, id_request, f"{request_id}.json")
+    json_path = json_path_for(request_id)
 
     # Проверяем что JSON существует
     if not os.path.exists(json_path):
@@ -1095,10 +925,7 @@ async def _regen_from_json(event, request_id):
         return
 
     # Загружаем контекст (инструкция + канал + сообщения + инструменты + предыдущий пост)
-    data = load_json(json_path)
-    prepare_request = data.get("request_to_save", [])
-    media_ids = data.get("media_ids", [])
-    url_to_msg = data.get("url_to_msg", {"msg": "", "url": ""})
+    prepare_request, media_ids, url_to_msg = load_post_context(json_path)
 
     log("file", f"Прочитан {json_path}:\n{json.dumps(prepare_request, ensure_ascii=False, indent=2)}")
     if not prepare_request:
@@ -1117,31 +944,7 @@ async def _regen_from_json(event, request_id):
     request_to_save = prepare_request
     to_ai = prepare_request
 
-    previous_id = None  # ID предыдущего взаимодействия для цепочки
-    while True:
-        interaction = await _call_gemini(to_ai, previous_id)
-        # Обрабатываем вызовы инструментов
-        function_results = []
-        for step in interaction.steps:
-            if step.type == "function_call":
-                result = available_functions[step.name](**step.arguments)
-                log("tool", f"{step.name}({step.arguments}) → {result}")
-                function_results.append({
-                    "type": "function_result",
-                    "name": step.name,
-                    "call_id": step.id,
-                    "result": [{"type": "text", "text": json.dumps(result)}],
-                })
-                # Сохраняем вызов инструмента в контекст
-                request_to_save.append({
-                    "type": "text",
-                    "text": f"[инструмент {step.name}]: запрос \"{step.arguments}\" → результат: {json.dumps(result, ensure_ascii=False)}"
-                })
-        # Если не было вызовов — AI готовит ответ
-        if not function_results:
-            break
-        to_ai = function_results
-        previous_id = interaction.id
+    interaction = await _loop_ai(to_ai, log_to=request_to_save)
 
     # Парсим ответ Gemini
     result = Output.model_validate_json(interaction.output_text)
@@ -1155,38 +958,11 @@ async def _regen_from_json(event, request_id):
             "text": f"пост: " + result.post_text
         })
 
-        # Кнопки модерации
-        buttons = [
-            [
-                Button.inline("✅ Опубликовать", data=f"publish:{new_id}"),
-                Button.inline("❌ Отклонить", data=f"reject:{new_id}"),
-            ],
-            [
-                Button.inline("🔄 Заново", data=f"regen:{new_id}"),
-            ],
-        ]
-        # Отправляем медиа отдельными сообщениями после текста
-        for media_path in media_ids:
-            if os.path.exists(media_path):
-                await telegram_bot.send_file(ADMIN_ID, media_path)
-                log("media", f"Медиа отправлено: {media_path}")
-        # Отправляем новый вариант поста админу
-        source_line = ""
-        if url_to_msg.get("url"):
-            source_line = f"[{url_to_msg.get('msg', '')}]({url_to_msg['url']})\n\n"
-        sent = await telegram_bot.send_message(
-            ADMIN_ID,
-            source_line + result.post_text,
-            parse_mode='md',
-            buttons=buttons,
-            link_preview=False,
-        )
+        # Отправляем новый вариант поста админу на модерацию
+        text = f"{source_line(url_to_msg)}{result.post_text}"
+        await send_for_moderation(id_request, text, moderation_buttons(new_id), request_to_save, media_ids, result.post_text, url_to_msg, new_id=new_id)
 
-        # Сохраняем контекст с новым ID
-        tmp_path = os.path.join(TEMP_DIR, id_request, f"{new_id}.json")
-        save_json({"request_to_save": request_to_save, "media_ids": media_ids, "post_text": result.post_text, "url_to_msg": url_to_msg}, tmp_path)
-
-        log("regen", f"Новый пост отправлен, msg_id={sent.id}")
+        log("regen", "Новый пост отправлен")
 
         # Удаляем старый JSON (он заменён новым)
         if os.path.exists(json_path):
@@ -1207,91 +983,70 @@ async def callback_handler(event):
     log("callback", f"action={action} request_id={request_id}")
 
     if action == "publish":
-        # Извлекаем chat_id из request_id (формат: chat_id_uuid)
-        id_request = request_id.rsplit("_", 1)[0]
-        json_path = os.path.join(TEMP_DIR, id_request, f"{request_id}.json")
+        json_path = json_path_for(request_id)
         if not os.path.exists(json_path):
             await event.answer("❌ JSON не найден", alert=True)
             return
-
-        log("var", f"id_request={id_request}")
-        log("var", f"json_path={json_path}")
 
         data_json = load_json(json_path)
         post_text = data_json.get("post_text", "")
         media_ids = data_json.get("media_ids", [])
         url_to_msg = data_json.get("url_to_msg", {})
 
-        source_line = ""
-        if url_to_msg.get("url"):
-            source_line = f"[{url_to_msg.get('msg', '')}]({url_to_msg['url']})\n\n"
-        full_text = source_line + post_text
+        full_text = source_line(url_to_msg) + post_text
 
         existing_media = [m for m in media_ids if os.path.exists(m)]
         if existing_media:
-            await telegram_user.send_file(CHANNEL_ID, existing_media, caption=full_text, parse_mode='md')
+            await telegram_user.send_file(CHANNEL_ID, existing_media, caption=full_text, parse_mode='HTML')
         else:
-            await telegram_user.send_message(CHANNEL_ID, full_text, parse_mode='md', link_preview=False)
+            await telegram_user.send_message(CHANNEL_ID, full_text, parse_mode='HTML', link_preview=False)
 
         log("publish", f"Опубликовано в CHANNEL_ID: {request_id}")
 
         # Удаляем JSON и медиа-файлы
-        os.remove(json_path)
-        for m in existing_media:
-            os.remove(m)
+        cleanup_post(json_path)
 
         msg = await event.get_message()
-        await event.edit(text=msg.text + "\n\n__✅ Опубликовано__", buttons=None, link_preview=False, parse_mode='md')
+        await event.edit(text=msg.text + "\n\n<i>✅ Опубликовано</i>", buttons=None, link_preview=False, parse_mode='HTML')
     elif action == "reject":
-        # Извлекаем chat_id из request_id (формат: chat_id_uuid)
-        id_request = request_id.rsplit("_", 1)[0]
-        json_path = os.path.join(TEMP_DIR, id_request, f"{request_id}.json")
+        json_path = json_path_for(request_id)
         if os.path.exists(json_path):
-            data_json = load_json(json_path)
-            for m in data_json.get("media_ids", []):
-                if os.path.exists(m):
-                    os.remove(m)
-            os.remove(json_path)
+            cleanup_post(json_path)
 
         msg = await event.get_message()
-        await event.edit(text=msg.text + "\n\n__❌ Отклонено__", buttons=None, link_preview=False, parse_mode='md')
+        await event.edit(text=msg.text + "\n\n<i>❌ Отклонено</i>", buttons=None, link_preview=False, parse_mode='HTML')
     elif action == "regen":
         msg = await event.get_message()
         await event.edit(
-            text=msg.text + "\n\n__🔄 Отправлено на перегенерацию...__",
+            text=msg.text + "\n\n<i>🔄 Отправлено на перегенерацию...</i>",
             buttons=None,
             link_preview=False,
-            parse_mode='md',
+            parse_mode='HTML',
         )
         bot_states[ADMIN_ID] = f"regen:{request_id}"
         await telegram_bot.send_message(ADMIN_ID, "Что не так? Что нужно изменить?", link_preview=False)
     elif action == "answer":
         msg = await event.get_message()
         await event.edit(
-            text=msg.text + "\n\n__Отправлено на дополнение словаря...__",
+            text=msg.text + "\n\n<i>Отправлено на дополнение словаря...</i>",
             buttons=None,
             link_preview=False,
-            parse_mode='md',
+            parse_mode='HTML',
         )
         bot_states[ADMIN_ID] = f"answer:{request_id}"
         await telegram_bot.send_message(ADMIN_ID, "формат: слово,слово - объяснение. ~доп инф. ссылки и тд", link_preview=False)
     elif action == "cancel":
-        id_request = request_id.rsplit("_", 1)[0]
-        json_path = os.path.join(TEMP_DIR, id_request, f"{request_id}.json")
+        json_path = json_path_for(request_id)
         if os.path.exists(json_path):
-            data_json = load_json(json_path)
-            for m in data_json.get("media_ids", []):
-                if os.path.exists(m):
-                    os.remove(m)
-            os.remove(json_path)
+            cleanup_post(json_path)
 
         msg = await event.get_message()
-        await event.edit(text=msg.text + "\n\n__❌ Отменено__", buttons=None, link_preview=False, parse_mode='md')
+        await event.edit(text=msg.text + "\n\n<i>❌ Отменено</i>", buttons=None, link_preview=False, parse_mode='HTML')
 
     elif action == "cancel_gen_post":
         bot_states.pop(event.sender_id, None)
         msg = await event.get_message()
-        await event.edit(text=msg.text + "\n\n__Отменено__", buttons=None, link_preview=False)
+        await event.edit(text=msg.text + "\n\n<i>Отменено</i>", buttons=None, link_preview=False, parse_mode='HTML')
         await event.answer("Отмена")
 
 
